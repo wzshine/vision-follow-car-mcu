@@ -1,0 +1,64 @@
+# Build outputs
+Release/
+build/
+cmake-build-*/
+.tools/
+
+# STM32/CubeIDE generated local metadata
+.metadata/
+.recommenders/
+.claude/
+
+# Object and dependency files
+*.o
+*.obj
+*.d
+*.su
+*.cyclo
+*.map
+*.list
+# CubeIDE objects.list is a Makefile dependency list, not a build artifact.
+!**/objects.list
+*.elf
+*.bin
+*.hex
+*.axf
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak_*
+*.orig
+*.swp
+Thumbs.db
+desktop.ini
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local secrets / environment
+.env
+.env.*
+!.env.example
+
+# Local deployment notes generated during setup
+docs/VULTR_SERVER_INVENTORY_*.md
+docs/DALIANG_PLATFORM_REBUILD_PLAN_*.md
+scripts/fix_vultr_codex_path.sh
+
+
+# --- 不纳入公开固件仓（本地保留，不入库）---
+/Debug/
+/uart_mcu_test.py
+/shcematicl/
+/selftest/
+/docs/
+/.agents/
+*.bak
+DlaBoard_B.ioc.bak
+source_bg_remove.jpg
+transparent_preview_checker.png
+transparent_result.png
+*_transparent.png
