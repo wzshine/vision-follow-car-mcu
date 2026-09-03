@@ -64,7 +64,11 @@ static inline float Screen_GetSpeedScale(uint16_t speed_key)
   {
     return SPEED_SCALE_HIGH;
   }
-  return 1.0f;
+  /* 认不出的键值取**最慢**的档，不是 100%。
+   * 从前这里返回 1.0f —— 一个认不出来的按键值会静静地主张满速上限。
+   * 主循环确实在上游过滤过取值，所以今天走不到这里；但一个默认值的方向
+   * 不该指望调用方替它兜底，而这个默认值的方向原来是反的。 */
+  return SPEED_SCALE_EXTRA_LOW;
 }
 
 void Screen_Init(void);

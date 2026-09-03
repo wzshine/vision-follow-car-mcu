@@ -62,6 +62,22 @@ SECTIONS
     . = ALIGN(4);
   } >FLASH
 
+
+  /*
+   * 镜像自述头，钉死在 FLASH 起点 +0x200（DBIS §11 / fw_image.h）。
+   *
+   * ⚠ 加载方必须在**同意运行这段代码之前**读到它，所以不能问镜像自己头在哪 ——
+   *   偏移必须是外面就知道的一个常数。而"向量表后面"会随中断向量数量移位。
+   * ⚠ F407 的向量表是 0x198 字节，0x200 在它之后且八字节对齐。
+   * ⚠ KEEP 是必须的：这个头**没有任何代码引用它**（它是给外面的工具读的），
+   *   --gc-sections 会把它整个丢掉，而编译和链接不会说一个字。
+   */
+  .fw_header (ORIGIN(FLASH) + 0x200) :
+  {
+    KEEP(*(.fw_header))
+    . = ALIGN(4);
+  } >FLASH
+
   /* The program code and other data into "FLASH" Rom type memory */
   .text :
   {
@@ -184,6 +200,25 @@ SECTIONS
     . = ALIGN(4);
     _ebss = .;         /* define a global symbol at bss end */
     __bss_end__ = _ebss;
+  } >RAM
+
+
+  /*
+   * 复位不清零的一小块 RAM。今天只放 g_hardfault_mark
+   * （HardFault 留给下一次开机的痕迹，见 stm32f4xx_it.c）。
+   *
+   * ⚠⚠ 必须**显式**放在这里，不能靠"孤儿段会被放到 .bss 后面"。
+   *   实测它确实落在 _ebss（启动代码清零到 _ebss 为止，不含）——
+   *   也就是**刚好**躲过清零。而"刚好"是链接顺序的运气，不是脚本的保证：
+   *   哪天段的顺序变了，这个痕迹会被静默清零，
+   *   于是"从来没发生过 HardFault"和"发生过但记录被抹了"变成同一个答案。
+   */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
   } >RAM
 
   /* User_heap_stack section, used to check that there is enough "RAM" Ram  type memory left */

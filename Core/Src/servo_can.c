@@ -83,6 +83,37 @@ static HAL_StatusTypeDef send_frame(ServoCAN_t *s, uint8_t cmd, const uint8_t pa
   return HAL_CAN_AddTxMessage(&hcan1, &txHeader, txData, &TxMailbox);
 }
 
+/*
+ * 会让转向机构**动**的命令，统一在这里过一道闸。
+ *
+ * 放在被调用的这一侧，不是放在调用点：原来的毛病正是"规则写在调用点里,
+ * 下一个调用点不会知道" —— 整车使能 PD10 在驱动那几处都判了，而
+ * ServoCAN_Enable 六处、GoToAbsolutePosition 三处一处都没判。
+ * 在九个地方补 if 是把同一个病抄九遍；放进这里，新加的调用点想漏也漏不掉。
+ *
+ * ! 只挡"让它动"的：使能=1、设定位置、相对移动、速度模式、写零点。
+ *   放行的是使能=0、停止、心跳、清报警 —— **停下来永远是允许的**,
+ *   一个连"停"都要许可的闸，在最需要它的时候就是障碍。
+ */
+static uint8_t may_actuate(ServoCAN_t *s)
+{
+  if (s == NULL) {
+    return 0U;
+  }
+  if (s->actuation_allowed != 0U) {
+    return 1U;
+  }
+  s->refused_count++;   /* 挡下要看得见 —— 静默的拒绝和坏掉的链路从外面一样 */
+  return 0U;
+}
+
+void ServoCAN_SetActuationAllowed(ServoCAN_t *s, uint8_t allowed)
+{
+  if (s != NULL) {
+    s->actuation_allowed = (allowed != 0U) ? 1U : 0U;
+  }
+}
+
 HAL_StatusTypeDef ServoCAN_SendLink(ServoCAN_t *s)
 {
   uint8_t payload[6] = {0};
@@ -92,6 +123,11 @@ HAL_StatusTypeDef ServoCAN_SendLink(ServoCAN_t *s)
 HAL_StatusTypeDef ServoCAN_Enable(ServoCAN_t *s, uint8_t enable)
 {
   uint8_t payload[6] = {0};
+  /* 关使能不过闸：停下来永远是允许的。 */
+  if ((enable != 0U) && (may_actuate(s) == 0U)) {
+    return HAL_ERROR;
+  }
+
   payload[0] = enable ? 1U : 0U;
   return send_frame(s, 0x25U, payload);
 }
@@ -106,6 +142,10 @@ HAL_StatusTypeDef ServoCAN_SetMaxSpeedForPositioning(ServoCAN_t *s, int32_t spee
 HAL_StatusTypeDef ServoCAN_GoToAbsolutePosition(ServoCAN_t *s, int32_t position)
 {
   uint8_t payload[6] = {0};
+  if (may_actuate(s) == 0U) {
+    return HAL_ERROR;
+  }
+
   pack_int32_to_bytes(position, &payload[1]);
   return send_frame(s, 0x22U, payload);
 }
@@ -113,6 +153,10 @@ HAL_StatusTypeDef ServoCAN_GoToAbsolutePosition(ServoCAN_t *s, int32_t position)
 HAL_StatusTypeDef ServoCAN_MoveRelative(ServoCAN_t *s, int32_t offset)
 {
   uint8_t payload[6] = {0};
+  if (may_actuate(s) == 0U) {
+    return HAL_ERROR;
+  }
+
   pack_int32_to_bytes(offset, &payload[1]);
   return send_frame(s, 0x21U, payload);
 }
@@ -120,6 +164,10 @@ HAL_StatusTypeDef ServoCAN_MoveRelative(ServoCAN_t *s, int32_t offset)
 HAL_StatusTypeDef ServoCAN_SetSpeedMode(ServoCAN_t *s, int32_t speed)
 {
   uint8_t payload[6] = {0};
+  if (may_actuate(s) == 0U) {
+    return HAL_ERROR;
+  }
+
   pack_int32_to_bytes(speed, &payload[1]);
   return send_frame(s, 0x20U, payload);
 }
@@ -142,6 +190,18 @@ HAL_StatusTypeDef ServoCAN_ClearAlarm(ServoCAN_t *s)
 HAL_StatusTypeDef ServoCAN_WriteCurrentPositionAsZero(ServoCAN_t *s, int32_t new_pos)
 {
   uint8_t payload[6] = {0};
+  if (may_actuate(s) == 0U) {
+    return HAL_ERROR;
+  }
+
   pack_int32_to_bytes(new_pos, &payload[1]);
   return send_frame(s, 0x50U, payload);
+}
+
+/* 主循环里那个实例的拒绝计数，给诊断用(ST? / 参数表)。
+ * 挡下要看得见 —— 一个静默的拒绝，和一条坏掉的链路，从外面看是一样的。 */
+extern ServoCAN_t g_servo;
+uint32_t g_servo_refused_count(void)
+{
+  return g_servo.refused_count;
 }

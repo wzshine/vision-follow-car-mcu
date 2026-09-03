@@ -22,6 +22,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "dla_cart_app.h"
+#include "board_inputs.h"
 #include "selftest.h"
 /* USER CODE END Includes */
 
@@ -111,7 +112,10 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+  /* 尽早启动看门狗：这样连 MX_*_Init 失败落进 Error_Handler() 的死循环
+   * 也能被咬醒。IWDG 由 LSI 驱动、和中断无关，Error_Handler 里的
+   * __disable_irq() 拦不住它。超时取值与理由见 dla_cart_app.c。 */
+  Board_WatchdogInit();
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -276,7 +280,21 @@ static void MX_CAN1_Init(void)
   hcan1.Init.TimeTriggeredMode = DISABLE;
   hcan1.Init.AutoBusOff = ENABLE;
   hcan1.Init.AutoWakeUp = DISABLE;
-  hcan1.Init.AutoRetransmission = ENABLE;
+  /*
+   * NART: 一帧发不出去就丢掉，不要一直重传。
+   *
+   * 0x210 是 20ms 的周期性控制帧 —— 它的价值全在"新"上。开着自动重传时，
+   * 总线上没有别的节点应答(驱动板掉电、接头脱开、总线短路)会让三个发送
+   * 邮箱被前三帧永久占住反复重传，之后每一次 AddTxMessage 都返回 HAL_ERROR。
+   * 于是司机踩下刹车、循环打包出 brake=1 的帧，**每一帧都在上线之前就被丢掉**；
+   * 等总线恢复，最先发出去的还是故障那一刻锁在邮箱里的陈旧帧(比如
+   * throttle=600, brake=0)。
+   *
+   * 关掉之后，发不出去的帧一次就作废，邮箱立刻腾给下一帧更新的命令。
+   * 单帧丢失的代价：下游超时是 300ms，要连丢 15 帧才够得着，
+   * 而每一帧都是完整的当前状态，不是增量。
+   */
+  hcan1.Init.AutoRetransmission = DISABLE;
   hcan1.Init.ReceiveFifoLocked = DISABLE;
   hcan1.Init.TransmitFifoPriority = DISABLE;
   if (HAL_CAN_Init(&hcan1) != HAL_OK)
@@ -767,6 +785,16 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+  /* PRND 四路档位开关(PD0/PD1/PD3/PD4)：按下接地为低，需要上拉。
+   * ! board_inputs.h 一直写着"Cube 中配置为 GPIOD 上拉输入"，而上面 Cube
+   *   生成的那一段把 PD0/1/3/4 和 PD8..PD13 一起配成了 GPIO_NOPULL ——
+   *   **头文件里说的那个上拉不存在**，四个针脚是浮空的。任何按审计头文件
+   *   的人都会得出"这里没问题"的结论。浮空输入在车用线束里读低 50ms 就足以
+   *   触发一次换挡，而其中一个档位正是 AUTO 上电使能的前提条件。 */
+  GPIO_InitStruct.Pin = GEAR_P_Pin | GEAR_R_Pin | GEAR_N_Pin | GEAR_D_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(GEAR_SW_GPIO_Port, &GPIO_InitStruct);
   /* USER CODE END MX_GPIO_Init_2 */
 }
 

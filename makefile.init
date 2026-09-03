@@ -1,0 +1,19 @@
+################################################################################
+# CubeIDE 生成的 Debug/makefile 第 6 行有 `-include ../makefile.init`，
+# 而 makefile.init 本身**不是**它生成的 —— 这是它留给用户的扩展点，
+# 重新生成代码时不会被覆盖。
+#
+# 这里唯一做的事：在解析阶段刷新 Core/Inc/build_info.h 里的 git 标识。
+# 取不到 sh 或 git 就什么也不做，build_info.h 缺失也不影响编译 ——
+# fw_version.h 用 __has_include 兜底，缺了就报 scm="unknown"。
+# 构建绝不因为这一步失败。
+################################################################################
+_DLA_BUILD_INFO := $(shell sh ../scripts/gen_build_info.sh 2>/dev/null)
+
+# 命令表的指纹同理。⚠ 这一步不只是"生成一个头文件"：它顺带**每次构建都
+# 对照一遍 foc_can.c 的分派**，所以一条新命令加进固件却忘了加进表里，
+# 在这里就会被说出来，而不是等到界面上画出一个分级错的按钮。
+# ⚠ 取不到 python 就跳过 —— 和上面同一条规矩：构建绝不因为诊断步骤失败。
+#   缺 cmd_hash.h 时 fw_version.h 用 __has_include 兜底，报不出 cmdhash，
+#   而上位机对"没报 cmdhash"的处理是**整张表不用** —— 安全方向。
+_DLA_CMD_HASH := $(shell python ../tools/gen_cmd_table.py --header ../Core/Inc/cmd_hash.h 2>/dev/null || python3 ../tools/gen_cmd_table.py --header ../Core/Inc/cmd_hash.h 2>/dev/null)

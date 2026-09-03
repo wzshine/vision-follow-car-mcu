@@ -14,7 +14,6 @@ static volatile uint32_t s_pulse_right = 0;
 static uint32_t s_pulse_left_snap = 0;
 static uint32_t s_pulse_right_snap = 0;
 static uint32_t s_last_calc_ms = 0;
-static uint16_t s_speed_01kmh = 0;
 
 void WheelSpeed_Init(void)
 {
@@ -27,7 +26,6 @@ void WheelSpeed_Init(void)
   s_pulse_left = 0;
   s_pulse_right = 0;
   s_last_calc_ms = HAL_GetTick();
-  s_speed_01kmh = 0;
 }
 
 void WheelSpeed_CaptureCallback(TIM_HandleTypeDef *htim)
@@ -71,17 +69,15 @@ void WheelSpeed_Task(void)
   s_pulse_left_snap = pl;
   s_pulse_right_snap = pr;
 
-  uint32_t pulses = (pl > 0U && pr > 0U) ? (pl + pr) / 2U : (pl + pr);
-
-  uint32_t speed_01kmh = pulses * WHEEL_CIRCUMFERENCE_MM * 36U
-                         / ((uint32_t)WHEEL_PULSES_PER_REV * elapsed_ms);
-
-  s_speed_01kmh = (uint16_t)(speed_01kmh > 9999U ? 9999U : speed_01kmh);
-}
-
-uint16_t WheelSpeed_GetSpeed_01kmh(void)
-{
-  return s_speed_01kmh;
+  /* 只留快照，不再换算成 km/h —— 那需要一个轮周长，而轮周长只有驱动板有。
+   *
+   * ! 顺带带走了一个和别处一模一样的错误：原来这里写
+   *       pulses = (pl > 0 && pr > 0) ? (pl + pr) / 2 : (pl + pr);
+   *   —— 一个轮子读到 0 就取和而不是取平均。同一个形状在
+   *   FocCAN_GetSpeed_01kmh 的 rpm 合成里、在 0x211 的 foc2 槽守卫里各出现
+   *   过一次，2026-08-25 同一天全部修掉。**三处不是三个 bug，是一个习惯**：
+   *   把"读到 0"当成"没有数据"。 */
+  (void)elapsed_ms;
 }
 
 uint32_t WheelSpeed_GetRawPulses_Left(void)

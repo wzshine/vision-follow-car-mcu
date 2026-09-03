@@ -132,7 +132,12 @@ static int test_vbus(void){
   char d[64]; snprintf(d,sizeof d,"raw=%lu pin=%lumV Vin~%lu.%luV",
     (unsigned long)raw,(unsigned long)pin_mv,(unsigned long)(vin_mv/1000),(unsigned long)((vin_mv%1000)/100));
   if(vin_mv>=6000 && vin_mv<=52000){ result("VBUS","PASS",d); return 1; }
-  result("VBUS","INFO",d); return 1; /* 不因供电不同判失败，仅报值 */
+  /* 量程外只报值不判失败(供电可能本来就不同)，但**也不能算通过** ——
+   * 从前两条分支都 return 1，而 cmd_runall 里是 `total++; pass+=test_vbus();`，
+   * 于是 0V 和 60V 在 SUMMARY 里都记一个 pass。这一项从写下来那天起就没有
+   * 失败的可能，而它每次都显示 OK，所有人都信。
+   * 返回 -1 = INFO：既不计通过也不计失败，和 test_adc_report 的既有约定一致。 */
+  result("VBUS","INFO",d); return -1;
 }
 
 static void test_adc_report(void){
@@ -290,7 +295,10 @@ static void i2c2_lines(void){
   int scl=HAL_GPIO_ReadPin(GPIOB,GPIO_PIN_10), sda=HAL_GPIO_ReadPin(GPIOB,GPIO_PIN_11);
   g.Mode=GPIO_MODE_AF_OD; g.Pull=GPIO_PULLUP; g.Speed=GPIO_SPEED_FREQ_VERY_HIGH; g.Alternate=GPIO_AF4_I2C2;
   HAL_GPIO_Init(GPIOB,&g);
-  char d[56]; snprintf(d,sizeof d,"NOPULL SCL=%d SDA=%d (1=有外部上拉, 0=PB10/11无外部上拉)",scl,sda);
+  /* 96 而不是 56：这串中文是 UTF-8，一个字三字节，56 装不下，编译器一直在
+   * 报 -Wformat-truncation。截断掉的正好是"0 是什么意思"那半句 ——
+   * 一条诊断信息被砍掉的，恰恰是它存在的理由。 */
+  char d[96]; snprintf(d,sizeof d,"NOPULL SCL=%d SDA=%d (1=有外部上拉, 0=PB10/11无外部上拉)",scl,sda);
   result("I2C2_LINES","INFO",d);
 }
 
@@ -475,7 +483,8 @@ static void cmd_runall(void){
   int pass=0, total=0;
   total++; pass+=test_imu();
   total++; pass+=test_eeprom();
-  total++; pass+=test_vbus();
+  { int v=test_vbus();           /* -1 = INFO：报了值但不构成判据，两边都不计 */
+    if(v>=0){ total++; pass+=v; } }
   test_adc_report();             /* 仅报值，不计入 pass/total */
   total++; pass+=test_can_loopback();
   test_led(1); HAL_Delay(300); test_led(0);

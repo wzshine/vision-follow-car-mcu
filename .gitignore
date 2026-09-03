@@ -1,64 +1,24 @@
-# Build outputs
-Release/
-build/
-cmake-build-*/
-.tools/
-
-# STM32/CubeIDE generated local metadata
-.metadata/
-.recommenders/
-.claude/
-
-# Object and dependency files
+# 这份树里有什么，由内部仓的 scripts/publish.sh 决定，不由这个文件决定。
+# 这里只挡构建产物 —— 编译一次就会出现，而它们不该跟着仓走。
+#
+# ⚠ Debug/ 下的 makefile 和 *.mk 是**编译必需的**，故意带着，不要加规则排除它们。
 *.o
-*.obj
 *.d
 *.su
 *.cyclo
 *.map
-*.list
-# CubeIDE objects.list is a Makefile dependency list, not a build artifact.
-!**/objects.list
 *.elf
 *.bin
 *.hex
 *.axf
-
-# Logs and temporary files
-*.log
-*.tmp
-*.bak_*
-*.orig
-*.swp
-Thumbs.db
-desktop.ini
-
-# Python caches
+*.list
+!Debug/objects.list
+Release/
+build/
 __pycache__/
-*.py[cod]
-.pytest_cache/
+*.pyc
 
-# Local secrets / environment
-.env
-.env.*
-!.env.example
-
-# Local deployment notes generated during setup
-docs/VULTR_SERVER_INVENTORY_*.md
-docs/DALIANG_PLATFORM_REBUILD_PLAN_*.md
-scripts/fix_vultr_codex_path.sh
-
-
-# --- 不纳入公开固件仓（本地保留，不入库）---
-/Debug/
-/uart_mcu_test.py
-/shcematicl/
-/selftest/
-/docs/
-/.agents/
-*.bak
-DlaBoard_B.ioc.bak
-source_bg_remove.jpg
-transparent_preview_checker.png
-transparent_result.png
-*_transparent.png
+# 生成物：由 tools/gen_cmd_table.py 和 scripts/gen_build_info.sh 每次重生成。
+# ⚠ 入库的话，改完 foc_can.c 忘了重生成，仓里那个数就是**别的构建**的指纹。
+Core/Inc/cmd_hash.h
+Core/Inc/build_info.h

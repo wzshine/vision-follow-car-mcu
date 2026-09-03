@@ -6,6 +6,7 @@
 #include "stm32f4xx_hal.h"
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #include "steering.h"
 #include "servo_can.h"
 #include "foc_can.h"
@@ -19,34 +20,15 @@
 #include "board_battery.h"
 #include "board_inputs.h"
 #include "imu_lsm6dsv.h"
+#include "drive_block.h"
+#include "cart_persist.h"
+#include "cart_params.h"
+#include "cart_param.h"
+#include "fw_version.h"
 
-#define POSITION_PER_REVOLUTION  10000
-#define AUTO_ROTATION_SPEED      280
-#define POSITION_TOLERANCE       100
-#define STEERING_GEAR_RATIO      15
-#define STEERING_RANGE_DEG       180
-#define STEERING_PHYSICAL_DEG    37
-#define STEERING_POSITION_RANGE  ((STEERING_RANGE_DEG * STEERING_GEAR_RATIO * POSITION_PER_REVOLUTION / 360) * 40 / 10)
-
-#define SCREEN_HEARTBEAT_INTERVAL_MS  2000
+/* 可调常量统一住在 cart_params.h —— 见那里开头关于"每个事实一个家"的说明。
+ * SCREEN_TIMEOUT_MS 仍是这里的一个 const 变量，因为 screen.h 按 extern 引用它。 */
 const uint32_t SCREEN_TIMEOUT_MS = 8000U;
-#define FOLLOW_CMD_TIMEOUT_MS  200U
-#define FOLLOW_READY_RESEND_MS 100U
-#define MAX_STEER_01           370
-#define VEHICLE_ENABLE_DEBOUNCE_MS 50U
-
-/* 自动驾驶模式参数(见 AUTONOMOUS_MODE_SPEC §6)。速度环增益/限速为保守起点，
- * 需台架标定(§9)后回填本表 + 规范。 */
-#define AUTO_CMD_TIMEOUT_MS        300U   /* §6.1 指令看门狗:超时→刹车+停+回中 */
-#define AUTO_MAX_SPEED_MM_S        1500   /* §6.2 硬限速(1.5 m/s)，双保险独立 clamp */
-#define AUTO_MAX_THROTTLE_PERMILLE 600U   /* 自动模式油门上限(保守)，0..1000 */
-#define AUTO_STATUS_PERIOD_MS      100U   /* §4 状态帧 ~10Hz */
-/* 速度环 PI(整数定点)：throttle = Kp*err + Ki*∫err，err 单位 mm/s，dt=20ms 定步长 */
-#define AUTO_SPD_KP_NUM            3L
-#define AUTO_SPD_KP_DEN            10L
-#define AUTO_SPD_KI_NUM            1L
-#define AUTO_SPD_KI_DEN            50L
-#define AUTO_SPD_I_MAX             30000L /* 积分限幅(抗饱和) */
 
 ServoCAN_t g_servo;
 FocCAN_t g_foc_can;
@@ -73,10 +55,29 @@ static uint16_t current_speed_level = SCREEN_KEY_SPEED_LOW;
 
 /* 联调诊断：暴露刹车仲裁输入到 CLI(ST?)，定位刹车继电器抖动源 */
 volatile uint16_t g_dbg_gear = 0;
+/* 四路档位输入的原始"是否为低"位图：bit0=P bit1=R bit2=N bit3=D（U7 脚 2..5）。
+ * ⚠ 和解出来的档位分开报，因为接线之后要拨一遍杆确认开关是不是持续闭合型的，
+ *   而"解出来的档位"看不出这件事。 */
+volatile uint8_t  g_dbg_gear_raw = 0U;
+/* 档位来源三态，见 board_inputs.h：NONE=从没解出过（屏可以设档）
+ * SWITCH=解出过（实体开关说了算）。 */
+volatile uint8_t  g_gear_src = GEAR_SRC_NONE;
+/* 两个故障计数分开，因为要查的线不一样：零路=断线/没插，多路=短路/先通后断。 */
+volatile uint32_t g_gear_none_count = 0U;
+volatile uint32_t g_gear_ambig_count = 0U;
 volatile uint8_t  g_dbg_bsw = 0;      /* 刹车开关 PE2/PE3 */
 volatile uint8_t  g_dbg_ven = 0;      /* 整车使能 PD10 */
 volatile uint8_t  g_dbg_fbrake = 0;   /* 当前刹车意图 */
 volatile uint32_t g_dbg_fbrake_chg = 0; /* 刹车意图跳变累计次数 */
+volatile uint32_t g_dbg_can_short = 0; /* 收到的短帧(DLC!=8)累计丢弃数 */
+volatile uint32_t g_dbg_can_fifo_ovf = 0;  /* 接收 FIFO0 溢出次数(溢出即覆盖，不锁) */
+volatile uint32_t g_dbg_can_busoff = 0;    /* 进入 bus-off 的次数(不是当前状态) */
+volatile uint8_t  g_dbg_can_busoff_now = 0;/* 此刻是不是在 bus-off 里 */
+/* 司机踩了多少油门，0..1000‰，与档位无关。整块板上只在主循环解算一次。 */
+volatile uint16_t g_pedal_permille = 0;
+/* 踏板 ADC 原始值。标定和换算读同一份。 */
+volatile uint16_t g_dbg_adc_raw = 0;
+volatile uint8_t  g_dbg_band = 0;      /* 当前主张的档位带 %，0 = 不声明 */
 
 /* RC3 远程遥控刹车状态：1=刹车，0=释放。直接镜像 RC3 两位开关位置(无软件自锁)。供 RC? 诊断查看。 */
 volatile uint8_t  g_rc_brake = 0;
@@ -179,8 +180,220 @@ static void Board_TuneTimersForCart(void)
   __HAL_TIM_ENABLE(&htim3);
 }
 
+
+/* ---------------------------------------------------------------------------
+ * 独立看门狗 (IWDG)
+ *
+ * 从前这块板上一个看门狗都没有：stm32f4xx_hal_conf.h 里 HAL_IWDG_MODULE_ENABLED
+ * 和 HAL_WWDG_MODULE_ENABLED 都是注释掉的，整棵树没有初始化也没有喂狗。
+ * 而 Error_Handler() 是 __disable_irq() 之后 while(1)，HardFault/MemManage/
+ * BusFault/UsageFault/NMI 也全都是裸 while(1) —— 任何一次进去，板子就彻底
+ * 不动了：0x210 停发，中断关掉，GPIO 冻在原地。下游驱动板 300ms 后会停力矩,
+ * 但**刹车意图是写在那一帧的一个 bit 里的**，帧不发了，下游只知道"停力矩"，
+ * 不知道"该刹车"。
+ *
+ * 直接写寄存器而不是走 HAL：Drivers/ 里根本没有 stm32f4xx_hal_iwdg.c，
+ * 打开 HAL_IWDG_MODULE_ENABLED 也拿不到 HAL_IWDG_Init。IWDG 一共四个寄存器,
+ * 与其往 Cube 管理的驱动集里塞文件、再去改它生成的 subdir.mk，不如照着
+ * 参考手册写这十行。
+ *
+ * 超时取标称 2s：LSI 在 F407 上标称 32kHz，数据手册范围 17~47kHz，
+ * 所以真实超时在 1.36s(47kHz) ~ 3.76s(17kHz) 之间。主循环最坏一趟约 100ms
+ * (1 秒边界上电池 ADC + 四次 9600 波特的屏幕阻塞写)，1.36s 有十倍余量。
+ * 初始化里有一次 HAL_Delay(500)，那一段中间补喂一次。
+ * ------------------------------------------------------------------------- */
+#define IWDG_KEY_RELOAD    0x0000AAAAU
+#define IWDG_KEY_WRITE_EN  0x00005555U
+#define IWDG_KEY_START     0x0000CCCCU
+#define IWDG_PRESCALER_64  0x04U      /* PR=4 → 分频 64 → 32kHz/64 = 500Hz */
+#define IWDG_RELOAD_2S     999U       /* 1000 拍 / 500Hz = 2.0s 标称 */
+
+volatile uint32_t g_reset_cause = 0U;  /* 上电时的 RCC->CSR 高位，见 Board_WatchdogInit */
+
+void Board_WatchdogInit(void)
+{
+  /* 先把复位原因取走再清 —— 不取的话，看门狗到底有没有咬过永远不会有人知道。
+   * 位定义见参考手册 RCC_CSR：IWDGRSTF(29) WWDGRSTF(30) LPWRRSTF(31)
+   * SFTRSTF(28) PORRSTF(27) PINRSTF(26) BORRSTF(25)。 */
+  g_reset_cause = RCC->CSR >> 24;
+  __HAL_RCC_CLEAR_RESET_FLAGS();
+
+  /*
+   * 顺序要紧：先写启动键，再解锁 PR/RLR。
+   *
+   * IWDG->SR 里的 PVU/RVU 要等 LSI 真的在跑之后才会清零，而 LSI 正是被
+   * 启动键 0xCCCC 拉起来的。先写 PR/RLR 再等 SR，就会永远等不到 ——
+   * 板子卡死在这个函数里，而且因为启动键还没写下去，看门狗本身也没跑起来,
+   * 连复位都不会发生。ST 自己的 HAL_IWDG_Init 就是先启动再解锁的。
+   * (这个顺序错误已经在台架上真的发生过一次：刷完之后串口彻底没有回应。)
+   *
+   * 等待也要有上限。这是一段在整车控制板启动路径最前面、看门狗还没生效
+   * 时跑的代码 —— 一个没有上限的 while 放在这里，正是它要防的那种东西。
+   */
+  IWDG->KR = IWDG_KEY_START;      /* 启动，同时拉起 LSI */
+  IWDG->KR = IWDG_KEY_WRITE_EN;   /* 解锁 PR/RLR */
+  IWDG->PR = IWDG_PRESCALER_64;
+  IWDG->RLR = IWDG_RELOAD_2S;
+  {
+    /* LSI 最慢 17kHz，一次 PR/RLR 写入生效约几个 LSI 周期。这里给
+     * 200000 次空转，168MHz 下远超那个量级；超时就带着 Cube 复位默认值
+     * (分频 4 / 重载 4095 ≈ 512ms @32kHz)继续跑，不卡在这里。 */
+    uint32_t guard = 200000U;
+    while ((IWDG->SR != 0U) && (guard != 0U)) {
+      guard--;
+    }
+  }
+  IWDG->KR = IWDG_KEY_RELOAD;
+}
+
+void Board_WatchdogKick(void)
+{
+  IWDG->KR = IWDG_KEY_RELOAD;
+}
+
+
+/*
+ * 0.1km/h -> mm/s，饱和而不是回绕。
+ *
+ * 从前两处站点都是 `(int32_t)meas_01kmh * 1000L / 36L` 之后直接强转 int16_t。
+ * 驱动板在 0x212[5:6] 里报一个 0xFFFF，算出来是 1 820 416 mm/s，截断成
+ * **-14592 mm/s** —— 一个很大的**倒车**速度，原样交给 Jetson 的控制器。
+ * 收下来的每个字节都来自另一块板，而没有任何地方检查过它的量级。
+ *
+ * 合理性上限在 FocCAN_SpeedFeedbackValid 里挡(超了整条反馈判为不算数)；
+ * 这里再做一次饱和，是因为"判为不算数"和"这个数字被用了"是两件事：
+ * 状态帧里那个字段总要填一个值，填一个错方向的大数比填一个饱和值糟得多。
+ */
+static int16_t speed_01kmh_to_mm_s(uint32_t meas_01kmh, uint8_t reverse)
+{
+  int32_t mm_s = (int32_t)((meas_01kmh * 1000UL) / 36UL);
+  if (mm_s > 32767) {
+    mm_s = 32767;
+  }
+  if (reverse != 0U) {
+    mm_s = -mm_s;
+  }
+  return (int16_t)mm_s;
+}
+
+
+volatile uint16_t g_drive_block = 0U;
+
+/*
+ * 只给短标识符，不给句子。
+ *
+ * 人话归上位机(BoardPack) —— 这是驱动板侧付了代价学到的一条：
+ * 句子写在固件里，改一句话就要发一次固件。
+ */
+
+/*
+ * ==================== 位 → 人话 ====================
+ *
+ * ⚠⚠ 这几行是我 2026-08-27 说过"不写"的东西 —— 当时的话是
+ * "固件只给短标识符和位图，**不给句子**，人话归上位机的 BoardPack，
+ * 否则改一句话就要发一次固件"。那句话本身没错，但它错在**范围**：
+ *
+ *   上位机的 `fault codes` 解析器（fault.ts 的 CODE_ROW / ADVICE 正则）
+ *   **要求固件给出 meaning 和 -> advice 两列** —— 它是照驱动板的实现写的，
+ *   而 BoardPack 里没有放故障人话的地方。
+ *   ⇒ 不给句子 = 这块板的 `fault_read` 永远是空的。
+ *
+ * ⇒ 接入的标准是**别人已经做成的那一套**，不是我一个人的品味。
+ *   句子写在这里，短、稳定、只说"是什么"和"下一步查哪儿"。
+ *   ⚠ 界面上的长篇解释仍然归 BoardPack —— 那一层没被这条推翻。
+ *
+ * ⚠ action 三选一，含义照上位机 fault.ts：
+ *     cut   —— 它在阻止驱动
+ *     limit —— 它在限制，但没有完全阻止
+ *     note  —— 只是记录，不阻止任何事
+ * ⚠ latched：本板的 drive_block 位全部是**活值**（条件消失就清），所以是 no。
+ *   而复位原因那几条是闩住的（要重新上电才变），是 yes。
+ */
+const DriveBlockDesc_t g_drive_block_desc[] = {
+  { DRIVE_BLOCK_VEH_ENABLE, "ven", "cut", 0,
+    "the vehicle enable switch is open, so no drive request may be sent",
+    "check the switch on PD10 / CN22 and its wiring; 'tlm' shows veh ven=" },
+  { DRIVE_BLOCK_GEAR, "gear", "cut", 0,
+    "the gear selector is not in a driving position (D, or R where allowed)",
+    "'GEAR?' shows the four raw inputs and the decoded gear; U7 pins 2..5 are P R N D" },
+  { DRIVE_BLOCK_BRAKE_SW, "brake_sw", "cut", 0,
+    "the brake pedal switch is pressed",
+    "release the pedal; a stuck switch reads pressed forever -- 'tlm' veh brake=" },
+  { DRIVE_BLOCK_RC_BRAKE, "rc_brake", "cut", 0,
+    "the remote emergency-stop channel is in the braking position",
+    "move the RC3 switch back; 'RC?' shows the pulse width and the link state" },
+  { DRIVE_BLOCK_RC_LOST, "rc_lost", "cut", 0,
+    "the remote link was alive and is now gone, while remote is the command source",
+    "check the receiver power and the bind; 'RC?' tells never/up/lost apart" },
+  { DRIVE_BLOCK_FOC_STALE, "foc_stale", "cut", 0,
+    "the drive board has stopped sending its status frame",
+    "check the CAN wiring and the 120R termination; 'tlm' can rx= should be climbing" },
+  { DRIVE_BLOCK_SPEED_INVALID, "spd_bad", "cut", 0,
+    "the road-speed feedback does not count, so the speed loop has nothing to close on",
+    "'tlm' spd spdok=0 says so; a stale telemetry frame looks exactly like a stopped vehicle" },
+  { DRIVE_BLOCK_HOST_STALE, "host_stale", "cut", 0,
+    "no fresh command from the host computer within the timeout",
+    "check the host link on USB2; 'param get auto_cmd_timeout' is the window" },
+  { DRIVE_BLOCK_HOST_DISABLE, "host_dis", "cut", 0,
+    "the host computer is connected but has not asked for drive to be enabled",
+    "the host must set the enable flag in its command frame" },
+  { DRIVE_BLOCK_CLI_TEST, "cli_test", "cut", 0,
+    "a bench CLI command is holding the drive request, so normal arbitration is bypassed",
+    "'FOC OFF' hands it back; the latch also expires on its own" },
+  { DRIVE_BLOCK_FOC_FROZEN, "foc_frozen", "cut", 0,
+    "frames still arrive from the drive board but its sequence number stopped moving",
+    "its application is stuck -- power-cycle the drive board; this is not a cable fault" },
+  { DRIVE_BLOCK_FOC_DISBELIEF, "foc_disbel", "cut", 0,
+    "the drive board says it no longer believes our command stream",
+    "it heard us and stopped trusting us -- a different wire from 'it never heard us'" },
+  { DRIVE_BLOCK_FOC_LOCKED, "foc_locked", "cut", 0,
+    "the drive board reports it is in LOCAL mode and will not act on the bus",
+    "unlock it at the drive board ('lock off'); a 0 here does NOT prove it is unlocked on firmware older than 0.4.11" },
+  /* ⚠ latched=1：这一条和上面十三条不同 —— 条件消失它也不会自己清。 */
+  { DRIVE_BLOCK_ESTOP, "estop", "cut", 1,
+    "the emergency stop is latched; every drive request is forced to stop and brake",
+    "'clear' releases it. This is a SOFTWARE e-stop -- there is no gate cut-off that bypasses the CPU" },
+};
+
+const unsigned g_drive_block_desc_count =
+  sizeof(g_drive_block_desc) / sizeof(g_drive_block_desc[0]);
+
+int DriveBlock_Describe(uint16_t bits, char *out, int out_size)
+{
+  const DriveBlockDesc_t *k_tab = g_drive_block_desc;
+  int n = 0;
+  unsigned i;
+
+  if ((out == NULL) || (out_size <= 0)) {
+    return 0;
+  }
+  out[0] = '\0';
+  if (bits == 0U) {
+    /* "没有任何一条在挡着"要有一个明确的词，不能是空字符串 ——
+     * 空字符串既像"没有阻止"，也像"这一行坏了"。 */
+    n = snprintf(out, (size_t)out_size, "none");
+    return (n < 0) ? 0 : n;
+  }
+  for (i = 0U; i < (DRIVE_BLOCK_DESC_COUNT); i++) {
+    if ((bits & k_tab[i].bit) != 0U) {
+      int w = snprintf(out + n, (size_t)(out_size - n), "%s%s", (n > 0) ? "," : "", k_tab[i].id);
+      if ((w < 0) || (w >= (out_size - n))) {
+        break;
+      }
+      n += w;
+    }
+  }
+  return n;
+}
+
 void DlaCart_AppInit(void)
 {
+  /* 参数持久化：先把存储层准备好，再按范围校验装载。
+   * ⚠ 装载失败（没器件 / 空 / CRC 坏）**不是错误路径** —— 出厂的板子就是空的，
+   *   此时全部参数保持编译期默认，而 `tlm` 的 persist 字段会说出是哪一种。 */
+  CartPersist_Init();
+  (void)CartPersist_Load();
+
   Board_TuneTimersForCart();
 
   RC_Input_Init();
@@ -197,7 +410,9 @@ void DlaCart_AppInit(void)
   Motor_Control_Init();
 
   Screen_Init();
+  Board_WatchdogKick();   /* 这一段 500ms 阻塞比看门狗最坏超时的四分之一还长 */
   HAL_Delay(500);
+  Board_WatchdogKick();
   Screen_SetInitialValues();
 
   (void)HAL_ADC_Start(&hadc1);

@@ -21,6 +21,20 @@
  *    若刹车/释放方向反了，把 RC_GetSwitch_RC3 里的 '>' 改成 '<' 即可。
  *  - RC_SW_USE_PWM=0：按稳定 DC 电平处理，直接读 GPIO(激活=高电平)。
  * 用 CLI "RC?" 看 sw 字段验证。 */
+/* 一路遥控多久没有新脉冲就算失效。RC PWM 帧约 50Hz(20ms)，200ms = 连丢 10 帧。 */
+#define RC_STALE_MS   200U
+
+/*
+ * 一路遥控通道的三态。"从来没接过"和"接过然后断了"必须分开回答：
+ * 前者不是一个源(本板今天四路都是 NEVER)，后者是一个失效的源。
+ * 详见 rc_input.c 里 link_state() 的说明。
+ */
+typedef enum {
+  RC_LINK_NEVER = 0,   /* 从来没收到过脉冲 —— 这一路没有接收机 */
+  RC_LINK_UP,          /* 最近 RC_STALE_MS 内收到过 */
+  RC_LINK_LOST         /* 曾经活过，现在断了 */
+} RcLink_t;
+
 #define RC_SW_USE_PWM             1
 #define RC_SW_PWM_ACTIVE_HIGH_US  1500   /* PWM 模式：脉宽 > 此值视为激活(刹车位/高位) */
 
@@ -44,7 +58,12 @@ uint32_t RC_GetUpdateCount_RC3(void);
 uint32_t RC_GetUpdateCount_RC4(void);
 uint32_t RC_GetCallbackCount_RC3(void);
 uint32_t RC_GetCallbackCount_RC4(void);
-uint8_t RC_GetSwitch_RC3(void);   /* 1=激活 → 刹车置位 */
+RcLink_t RC_LinkState_CH1(void);
+RcLink_t RC_LinkState_CH2(void);
+RcLink_t RC_LinkState_RC3(void);
+RcLink_t RC_LinkState_RC4(void);
+
+uint8_t RC_GetSwitch_RC3(void);   /* 1=激活 → 刹车置位；链路曾活过而现在断了也返回 1 */
 uint8_t RC_GetSwitch_RC4(void);   /* 1=激活 → 刹车复位/释放 */
 
 #endif
